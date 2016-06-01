@@ -19,18 +19,19 @@ This Sketch is designed to work on a ESP-8266 MUANODE 0.9 board
 #include "secrets.h"              // holds wifi credentials & MQTT credentials
 #include "pins.h"                 // holds pin definitions
 
+#define CoopTrollerVersion "3.03"
 // print debug messages or not to serial
 int Debugging = 1;
 
 // MQTT Subscription Channels
 #define sTime    "time/beacon"
-#define sRemote  "coop2/remotetrigger"
+#define sRemote  "coop3/remotetrigger"
 #define sSunRise "sun/rise"
 #define sSunSet  "sun/set"
 
 // MQTT Publish Channels
-#define pLight  "coop2/brightness"
-#define pStatus "coop2/status"
+#define pLight  "coop3/brightness"
+#define pStatus "coop3/status"
 
 // DOOR motion
 #define GO     0
@@ -63,7 +64,7 @@ String        doorState          =    "Uninitialzed"; // Values will be one of: 
 String        doorStatePrev      =    "";
 int           brightness         =     0;
 int           openBright         =    40; // brightness to wait until opening the door
-int           closeBright        =    35; // brightness to wait until closing the door
+int           closeBright        =    25; // brightness to wait until closing the door
 int           doorTopVal         =     0;
 int           doorTopVal2        =     0;
 int           doorTopState       =     0;
@@ -81,7 +82,7 @@ DateTime      now;
 RTC_DS1307 RTC;
 EspClass esp;
 WiFiClient espClient;
-LiquidCrystal_I2C lcd(0x27, 20, 4);
+LiquidCrystal_I2C lcd(0x27, 20, 4);   // i2c address x27, 4 rows x 20 cols
 PubSubClient mqtt(espClient);
 
 // Setup debounce software
@@ -433,6 +434,24 @@ void handleSensorReadings() {
   }
 }
 
+void lcd_update(){
+  //lcd.init();
+  lcd.setCursor(0,0);
+  lcd.print("IP:");
+  lcd.print(WiFi.localIP());
+  lcd.setCursor(0,1);
+  now = RTC.now();
+  char buf[16];
+  sprintf(buf,"Time:%02d:%02d Light:%03d",now.hour(),now.minute(),brightness);
+  lcd.print(buf);
+  lcd.setCursor(0,2);
+  lcd.print("Door:");
+  lcd.print(doorState);
+  lcd.setCursor(0,3);
+  lcd.print("Locked:");
+  lcd.print(remoteLockStart>0);
+}
+
 /**
  * Initialization on startup.
  */
@@ -465,11 +484,13 @@ void setup() {
   // Get the RTC going
   Wire.begin(rtcSDA,rtcSCL);
   lcd.init();
+  delay(500);
   lcd.init();
   lcd.backlight();
-  lcd.print(" coopController ");
+  lcd.print(" CoopTroller  ");
+  lcd.print(CoopTrollerVersion);
   lcd.setCursor(0,1);
-  lcd.print(">Pablo  Sanchez<");
+  lcd.print(" (C)2016 P. Sanchez");
   // Set the outputs
   if (! RTC.begin()) {
     Serial.println("Couldn't find RTC");
@@ -640,13 +661,6 @@ void setup() {
   Serial.println(WiFi.localIP());
 }
 
-void lcd_update(){
-  lcd.setCursor(0,1);
-  now = RTC.now();
-  char buf[16];
-  sprintf(buf,"Time:%02d:%02d Light:%03d",now.hour(),now.minute(),brightness);
-  lcd.print(buf);
-}
 /**
  * Main program loop
  */
@@ -654,25 +668,19 @@ void loop() {
   ArduinoOTA.handle();
   lcd_update();
   mqtt.loop();
-  // 5 second pause on initial startup to let devices settle, wifi connect, etc.
-//  if (millis() > 5000) {
+  debounceTop.update();
+  doorTopState = debounceTop.read();
+  debounceBot.update();
+  doorBottomState = debounceBot.read();
 
-    // Update top & bottom switches
-    debounceTop.update();
-    doorTopState = debounceTop.read();
-    debounceBot.update();
-    doorBottomState = debounceBot.read();
+  // Read new data from sensors
+  readSensors();
 
-    // Read new data from sensors
-    readSensors();
+  if (remoteLockStart == 0 || (unsigned long)(millis() - remoteLockStart) > remoteOverride) {
+    // Respond to sensor data
+    handleSensorReadings();
+  }
 
-    if (remoteLockStart == 0 ||
-        (unsigned long)(millis() - remoteLockStart) > remoteOverride) {
-      // Respond ot sensor data
-      handleSensorReadings();
-    }
-
-    // Move the door as needed
-    doorMove();
- // }
+  // Move the door as needed
+  doorMove();
 }
