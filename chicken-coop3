@@ -4,6 +4,7 @@ Based loosely on code by Will Vincent <will@willvincent.com>
 This Sketch is designed to work on a ESP-8266 MUANODE 0.9 board
 */
 
+#include "options.h"
 #include <Wire.h>                 // https://www.arduino.cc/en/Reference/Wire
 #include <ESP8266WiFi.h>          // https://github.com/esp8266/Arduino
 #include <ESP8266WebServer.h>
@@ -15,13 +16,13 @@ This Sketch is designed to work on a ESP-8266 MUANODE 0.9 board
 #include <PubSubClient.h>         // https://github.com/knolleary/pubsubclient
 #include <Bounce2.h>              // https://github.com/thomasfredericks/Bounce2
 #include <RTClib.h>               // https://github.com/adafruit/RTClib
-//#include <LiquidCrystal_I2C.h>
+#ifdef LCD_DISPLAY
+  #include <LiquidCrystal_I2C.h>
+#endif
 #include "secrets.h"              // holds wifi credentials & MQTT credentials
 #include "pins.h"                 // holds pin definitions
 
 #define CoopTrollerVersion "3.03"
-// print debug messages or not to serial
-int Debugging = 1;
 
 // MQTT Subscription Channels
 #define sTime    "time/beacon"
@@ -82,7 +83,7 @@ DateTime      now;
 RTC_DS1307 RTC;
 EspClass esp;
 WiFiClient espClient;
-#ifdef LiquidCrystal_I2C_h
+#ifdef LCD_DISPLAY
 LiquidCrystal_I2C lcd(0x27, 20, 4);   // i2c address x27, 4 rows x 20 cols
 #endif
 PubSubClient mqtt(espClient);
@@ -436,7 +437,7 @@ void handleSensorReadings() {
   }
 }
 
-#ifdef LiquidCrystal_I2C_h
+#ifdef LCD_DISPLAY
 void lcd_update(){
   //lcd.init();
   lcd.setCursor(0,0);
@@ -486,7 +487,7 @@ void setup() {
 
   // Get the RTC going
   Wire.begin(rtcSDA,rtcSCL);
-  #ifdef LiquidCrystal_I2C_h
+  #ifdef LCD_DISPLAY
   lcd.init();
   delay(500);
   lcd.init();
@@ -535,7 +536,7 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
-    #ifdef LiquidCrystal_I2C_h
+    #ifdef LCD_DISPLAY
     lcd.clear();
     lcd.print("IP:");
     lcd.print(WiFi.localIP());
@@ -548,7 +549,7 @@ void setup() {
     }
   } else {
     wifiConnected = false;
-    #ifdef LiquidCrystal_I2C_h
+    #ifdef LCD_DISPLAY
     lcd.clear();
     lcd.print("No WiFi");
     #endif
@@ -604,7 +605,7 @@ void setup() {
        if (Debugging) {
            Serial.println("Door broken. Opened and closed simultaneously. Halting");
        }
-       #ifdef LiquidCrystal_I2C_h
+       #ifdef LCD_DISPLAY
        lcd.clear();
        lcd.print("Motor Insane");
        lcd.setCursor(0,1);
@@ -677,7 +678,7 @@ void setup() {
  */
 void loop() {
   ArduinoOTA.handle();
-  #ifdef LiquidCrystal_I2C_h
+  #ifdef LCD_DISPLAY
   lcd_update();
   #endif
   mqtt.loop();
