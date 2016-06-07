@@ -15,7 +15,7 @@ This Sketch is designed to work on a ESP-8266 MUANODE 0.9 board
 #include <PubSubClient.h>         // https://github.com/knolleary/pubsubclient
 #include <Bounce2.h>              // https://github.com/thomasfredericks/Bounce2
 #include <RTClib.h>               // https://github.com/adafruit/RTClib
-#include <LiquidCrystal_I2C.h>
+//#include <LiquidCrystal_I2C.h>
 #include "secrets.h"              // holds wifi credentials & MQTT credentials
 #include "pins.h"                 // holds pin definitions
 
@@ -25,13 +25,13 @@ int Debugging = 1;
 
 // MQTT Subscription Channels
 #define sTime    "time/beacon"
-#define sRemote  "coop3/remotetrigger"
+#define sRemote  "coop/remotetrigger"
 #define sSunRise "sun/rise"
 #define sSunSet  "sun/set"
 
 // MQTT Publish Channels
-#define pLight  "coop3/brightness"
-#define pStatus "coop3/status"
+#define pLight  "coop/brightness"
+#define pStatus "coop/status"
 
 // DOOR motion
 #define GO     0
@@ -82,7 +82,9 @@ DateTime      now;
 RTC_DS1307 RTC;
 EspClass esp;
 WiFiClient espClient;
+#ifdef LiquidCrystal_I2C_h
 LiquidCrystal_I2C lcd(0x27, 20, 4);   // i2c address x27, 4 rows x 20 cols
+#endif
 PubSubClient mqtt(espClient);
 
 // Setup debounce software
@@ -434,6 +436,7 @@ void handleSensorReadings() {
   }
 }
 
+#ifdef LiquidCrystal_I2C_h
 void lcd_update(){
   //lcd.init();
   lcd.setCursor(0,0);
@@ -451,7 +454,7 @@ void lcd_update(){
   lcd.print("Locked:");
   lcd.print(remoteLockStart>0);
 }
-
+#endif
 /**
  * Initialization on startup.
  */
@@ -483,6 +486,7 @@ void setup() {
 
   // Get the RTC going
   Wire.begin(rtcSDA,rtcSCL);
+  #ifdef LiquidCrystal_I2C_h
   lcd.init();
   delay(500);
   lcd.init();
@@ -491,6 +495,7 @@ void setup() {
   lcd.print(CoopTrollerVersion);
   lcd.setCursor(0,1);
   lcd.print(" (C)2016 P. Sanchez");
+  #endif
   // Set the outputs
   if (! RTC.begin()) {
     Serial.println("Couldn't find RTC");
@@ -530,9 +535,11 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
+    #ifdef LiquidCrystal_I2C_h
     lcd.clear();
     lcd.print("IP:");
     lcd.print(WiFi.localIP());
+    #endif
     if (Debugging) {
        Serial.println("");
        Serial.println("WiFi connected");
@@ -541,8 +548,10 @@ void setup() {
     }
   } else {
     wifiConnected = false;
+    #ifdef LiquidCrystal_I2C_h
     lcd.clear();
     lcd.print("No WiFi");
+    #endif
     if (Debugging) {
        Serial.println("");
        Serial.println("WiFi UNconnected");
@@ -595,11 +604,13 @@ void setup() {
        if (Debugging) {
            Serial.println("Door broken. Opened and closed simultaneously. Halting");
        }
+       #ifdef LiquidCrystal_I2C_h
+       lcd.clear();
+       lcd.print("Motor Insane");
+       lcd.setCursor(0,1);
+       lcd.print("Halting.");
+       #endif
        if (wifiConnected) {
-          lcd.clear();
-          lcd.print("Motor Insane");
-          lcd.setCursor(0,1);
-          lcd.print("Halting.");
           mqtt.publish(pStatus,"door|insane");
        }
        while(1);
@@ -630,13 +641,13 @@ void setup() {
     Serial.println(doorState);
   }
   // Port defaults to 8266
-  // ArduinoOTA.setPort(8266);
+  ArduinoOTA.setPort(8266);
 
   // Hostname defaults to esp8266-[ChipID]
   // ArduinoOTA.setHostname("myesp8266");
 
   // No authentication by default
-  // ArduinoOTA.setPassword((const char *)"123");
+  ArduinoOTA.setPassword((const char *)"123");
 
   ArduinoOTA.onStart([]() {
     Serial.println("Start");
@@ -666,7 +677,9 @@ void setup() {
  */
 void loop() {
   ArduinoOTA.handle();
+  #ifdef LiquidCrystal_I2C_h
   lcd_update();
+  #endif
   mqtt.loop();
   debounceTop.update();
   doorTopState = debounceTop.read();
