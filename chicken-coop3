@@ -5,6 +5,7 @@ This Sketch is designed to work on a ESP-8266 MUANODE 0.9 board
 */
 
 #include "options.h"
+#include <FS.h>                   //this needs to be first, or it all crashes and burns...
 #include <Wire.h>                 // https://www.arduino.cc/en/Reference/Wire
 #include <ESP8266WiFi.h>          // https://github.com/esp8266/Arduino
 #include <ESP8266WebServer.h>
@@ -19,20 +20,22 @@ This Sketch is designed to work on a ESP-8266 MUANODE 0.9 board
 #ifdef LCD_DISPLAY
   #include <LiquidCrystal_I2C.h>
 #endif
-#include "secrets.h"              // holds wifi credentials & MQTT credentials
+#include <ArduinoJson.h>          // https://github.com/bblanchon/ArduinoJson
+//#include "secrets.h"              // holds wifi credentials & MQTT credentials
+#define mClientID "coop-duino"
 #include "pins.h"                 // holds pin definitions
 
-#define CoopTrollerVersion "3.03"
+#define CoopTrollerVersion "3.04c"
 
 // MQTT Subscription Channels
 #define sTime    "time/beacon"
-#define sRemote  "coop/remotetrigger"
+#define sRemote  "coop3/remotetrigger"
 #define sSunRise "sun/rise"
 #define sSunSet  "sun/set"
 
 // MQTT Publish Channels
-#define pLight  "coop/brightness"
-#define pStatus "coop/status"
+#define pLight  "coop3/brightness"
+#define pStatus "coop3/status"
 
 // DOOR motion
 #define GO     0
@@ -47,44 +50,58 @@ const unsigned long maxMotorOn      =    15000; // Maximum time for the motor to
 
 // Night time lockout to prevent reaction to light sensor readings if an exterior light source causes
 // a reading otherwise bright enough to activate the interior light and/or door.
-const boolean       nightLock      =      true; // Enable night time lockout
+const boolean       nightLock      =      false; // Enable night time lockout
 
 /*************************************************
        DO   NOT   EDIT   BELOW   THIS   LINE
  *************************************************/
 
 // Runtime variables
-int           nightLockStart     =    22; // Hour (in 24hr time) to initiate night time lockout (10pm)
-int           nightLockEnd       =     4; // Hour (in 24hr time) to end night time lockout (4am)
-unsigned long lastDebounce       =     0;
-unsigned long lastLightRead      =     0;
-unsigned long lastRTCSync        =     0;
-unsigned long remoteLockStart    =     0;
-unsigned long motorRunning       =     0;  // how long has the motor been on
-String        doorState          =    "Uninitialzed"; // Values will be one of: closed, closing, open, opening, unknown
-String        doorStatePrev      =    "";
-int           brightness         =     0;
-int           openBright         =    40; // brightness to wait until opening the door
-int           closeBright        =    25; // brightness to wait until closing the door
-int           doorTopVal         =     0;
-int           doorTopVal2        =     0;
-int           doorTopState       =     0;
-int           doorTopPrev        =     0;
-int           doorBottomVal      =     0;
-int           doorBottomVal2     =     0;
-int           doorBottomState    =     0;
-int           doorBottomPrev     =     0;
-uint32_t      bootTime           =     0;
-int           motorHalted        =     0; // Motor protection in case of run away condition
+int           nightLockStart     =     22; // Hour (in 24hr time) to initiate night time lockout (10pm)
+int           nightLockEnd       =      4; // Hour (in 24hr time) to end night time lockout (4am)
+unsigned long lastDebounce       =      0;
+unsigned long lastLightRead      =      0;
+unsigned long lastRTCSync        =      0;
+unsigned long remoteLockStart    =      0;
+unsigned long motorRunning       =      0;  // how long has the motor been on
+unsigned long motorTimeOut       = 300000;  // Time to wait before running motor again (5 minutes)
+unsigned long lastMotorRun       =      0;  // last time the motor was activated
+String        doorState          =     "Uninitialzed"; // Values will be one of: closed, closing, open, opening, unknown
+String        doorStatePrev      =     "";
+int           brightness         =      0;
+int           openBright         =     40; // brightness to wait until opening the door
+int           closeBright        =     25; // brightness to wait until closing the door
+int           doorTopVal         =      0;
+int           doorTopVal2        =      0;
+int           doorTopState       =      0;
+int           doorTopPrev        =      0;
+int           doorBottomVal      =      0;
+int           doorBottomVal2     =      0;
+int           doorBottomState    =      0;
+int           doorBottomPrev     =      0;
+uint32_t      bootTime           =      0;
+int           motorHalted        =      0; // Motor protection in case of run away condition
 char          mqtt_msg_buf[100];
 DateTime      now;
+
+//define your default values here, if there are different values in config.json, they are overwritten.
+char mqtt_server[40];
+char mqtt_port[6] = "8080";
+//flag for saving data
+bool shouldSaveConfig = false;
+
+//callback notifying us of the need to save config
+void saveConfigCallback () {
+  Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
 
 // Define the hardware components
 RTC_DS1307 RTC;
 EspClass esp;
 WiFiClient espClient;
 #ifdef LCD_DISPLAY
-LiquidCrystal_I2C lcd(0x27, 20, 4);   // i2c address x27, 4 rows x 20 cols
+LiquidCrystal_I2C lcd(0x27, LCD_COLS, LCD_ROWS);   // i2c address x27, 4 rows x 20 cols
 #endif
 PubSubClient mqtt(espClient);
 
@@ -183,12 +200,23 @@ void mqttData(char* topic, byte* payload, unsigned int plen) {
     // If door is currently moving, the trigger is ignored.
     if (data == "unlock") {  // this will immediately put the system back into normal operation (i.e., using the light sensor)
       remoteLockStart = 0;
+      if (wifiConnected) {
+        mqtt.publish(pStatus, "remotetrigger|unlock");
+      }
       if(Debugging) {
         Serial.println("remoteLockStart unset");
       }
     }
+     if (data == "reboot") {
+      if (wifiConnected) {
+        mqtt.publish(pStatus, "remotetrigger|reboot");
+      }
+      ESP.restart();
+    }
     if (data == "debug") {
       Debugging = 1 - Debugging;
+      Serial.print("Debugging now: ");
+      Serial.println(Debugging);
     }
     if (data == "door") {
       if(Debugging) {
@@ -360,17 +388,15 @@ void readSensors() {
     if (wifiConnected) {
        mqtt.publish(pLight, buf);
     }
-      if (Debugging) {
-        Serial.print("Free mem: ");
-        Serial.println(esp.getFreeHeap());
-        Serial.print("Millis: ");
-        Serial.println(millis());
+    if (Debugging) {
         Serial.print("MQTT State: ");
         Serial.println(mqtt.state());
-      }
+        Serial.print("Wifi State: ");
+        Serial.println(WiFi.status()); 
+    }
     if (Debugging) {
-      Serial.print("Brightness is ");
-      Serial.println(brightness);
+      now = RTC.now();
+      Serial.printf("Time:%02d:%02d Light:%03d\n",now.hour(),now.minute(),brightness);
     }
 
   }
@@ -437,6 +463,18 @@ void handleSensorReadings() {
   }
 }
 
+int stringToNumber(String thisString) {
+  int i, value, length;
+  length = thisString.length();
+  char blah[(length + 1)];
+  for (i = 0; i < length; i++) {
+    blah[i] = thisString.charAt(i);
+  }
+  blah[i] = 0;
+  value = atoi(blah);
+  return value;
+}
+
 #ifdef LCD_DISPLAY
 void lcd_update(){
   //lcd.init();
@@ -445,7 +483,7 @@ void lcd_update(){
   lcd.print(WiFi.localIP());
   lcd.setCursor(0,1);
   now = RTC.now();
-  char buf[16];
+  char buf[LCD_COLS];
   sprintf(buf,"Time:%02d:%02d Light:%03d",now.hour(),now.minute(),brightness);
   lcd.print(buf);
   lcd.setCursor(0,2);
@@ -456,6 +494,122 @@ void lcd_update(){
   lcd.print(remoteLockStart>0);
 }
 #endif
+
+void WiFiConfig(int reset_config) {
+  
+  //clean FS, for testing
+  //SPIFFS.format();
+
+  //read configuration from FS json
+  Serial.println("mounting FS...");
+
+  if (SPIFFS.begin()) {
+    Serial.println("mounted file system");
+    if (SPIFFS.exists("/config.json")) {
+      //file exists, reading and loading
+      Serial.println("reading config file");
+      File configFile = SPIFFS.open("/config.json", "r");
+      if (configFile) {
+        Serial.println("opened config file");
+        size_t size = configFile.size();
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+        DynamicJsonBuffer jsonBuffer;
+        JsonObject& json = jsonBuffer.parseObject(buf.get());
+        json.printTo(Serial);
+        if (json.success()) {
+          Serial.println("\nparsed json");
+
+          strcpy(mqtt_server, json["mqtt_server"]);
+          strcpy(mqtt_port, json["mqtt_port"]);
+
+        } else {
+          Serial.println("failed to load json config");
+        }
+      }
+    }
+  } else {
+    Serial.println("failed to mount FS");
+  }
+  //end read
+
+  // The extra parameters to be configured (can be either global or just in the setup)
+  // After connecting, parameter.getValue() will get you the configured value
+  // id/name placeholder/prompt default length
+  WiFiManagerParameter custom_mqtt_server("server", "mqtt server", mqtt_server, 40);
+  WiFiManagerParameter custom_mqtt_port("port", "mqtt port", mqtt_port, 5);
+
+  //WiFiManager
+  //Local intialization. Once its business is done, there is no need to keep it around
+  WiFiManager wifiManager;
+
+  //set config save notify callback
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+
+  //set static ip
+  //wifiManager.setSTAStaticIPConfig(IPAddress(10,0,1,99), IPAddress(10,0,1,1), IPAddress(255,255,255,0));
+  
+  //add all your parameters here
+  wifiManager.addParameter(&custom_mqtt_server);
+  wifiManager.addParameter(&custom_mqtt_port);
+ 
+  //reset settings - for testing
+  if (reset_config) {
+     wifiManager.resetSettings();
+  }
+
+  //set minimu quality of signal so it ignores AP's under that quality
+  //defaults to 8%
+  //wifiManager.setMinimumSignalQuality();
+  
+  //sets timeout until configuration portal gets turned off
+  //useful to make it all retry or go to sleep
+  //in seconds
+  //wifiManager.setTimeout(120);
+
+  //fetches ssid and pass and tries to connect
+  //if it does not connect it starts an access point with the specified name
+  //here  "AutoConnectAP"
+  //and goes into a blocking loop awaiting configuration
+  if (!wifiManager.autoConnect("AutoConnectAP", "password")) {
+    Serial.println("failed to connect and hit timeout");
+    delay(3000);
+    //reset and try again, or maybe put it to deep sleep
+    ESP.reset();
+    delay(5000);
+  }
+
+  //if you get here you have connected to the WiFi
+  Serial.println("connected...yeey :)");
+
+  //read updated parameters
+  strcpy(mqtt_server, custom_mqtt_server.getValue());
+  strcpy(mqtt_port, custom_mqtt_port.getValue());
+
+  //save the custom parameters to FS
+  if (shouldSaveConfig) {
+    Serial.println("saving config");
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject& json = jsonBuffer.createObject();
+    json["mqtt_server"] = mqtt_server;
+    json["mqtt_port"] = mqtt_port;
+
+    File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+      Serial.println("failed to open config file for writing");
+    }
+
+    json.printTo(Serial);
+    json.printTo(configFile);
+    configFile.close();
+    //end save
+  }
+
+  Serial.println("local ip");
+  Serial.println(WiFi.localIP());
+}
 /**
  * Initialization on startup.
  */
@@ -496,7 +650,30 @@ void setup() {
   lcd.print(CoopTrollerVersion);
   lcd.setCursor(0,1);
   lcd.print(" (C)2016 P. Sanchez");
+  lcd.setCursor(0,2);
+  lcd.print("Compiled on:");
+  lcd.setCursor(0,3);
+  DateTime now = DateTime(__DATE__,__TIME__);
+  lcd.print(now.day(), DEC);
+  lcd.print('/');
+  lcd.print(now.month(), DEC);
+  lcd.print('/');
+  lcd.print(now.year(), DEC);
+  lcd.print(' ');
+  if (now.hour()<10) 
+    lcd.print('0');
+  lcd.print(now.hour(), DEC);
+  lcd.print(':');
+  if (now.minute()<10)
+    lcd.print('0');
+  lcd.print(now.minute(), DEC);
+  lcd.print(':');
+  if (now.second()<10)
+    lcd.print('0');
+  lcd.print(now.second(), DEC);
+  delay(750);
   #endif
+  
   // Set the outputs
   if (! RTC.begin()) {
     Serial.println("Couldn't find RTC");
@@ -513,26 +690,27 @@ void setup() {
     now = RTC.now();
     Serial.printf("RTC time is: %0d:%0d\n",now.hour(),now.minute());
   }
-
+   
   if (Debugging) {
     Serial.println("ARDUINO: Setup WIFI");
   }
 
   // Wifi Connect
-  WiFi.disconnect();
+  //WiFi.disconnect();
 
-  delay(200);
+  //delay(200);
+  WiFiConfig(0);
 
-  WiFi.begin(wHost, wPass);
+  //WiFi.begin(wHost, wPass);
 
-  int wifitry = 60; // try for 30 seconds then move on
-  while (WiFi.status() != WL_CONNECTED &&  wifitry >0 ) {
-    delay(100);
-    wifitry--;
-    if (Debugging) {
-       Serial.print(".");
-    }
-  }
+  //int wifitry = 60; // try for 30 seconds then move on
+  //while (WiFi.status() != WL_CONNECTED &&  wifitry >0 ) {
+  //  delay(100);
+  //  wifitry--;
+  //  if (Debugging) {
+  //     Serial.print(".");
+  //  }
+  //}
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
@@ -562,13 +740,13 @@ void setup() {
   if (Debugging) {
     Serial.println("ARDUINO: Setup MQTT client");
     Serial.print("Client|port: ");
-    Serial.print(mHost);
+    Serial.print(mqtt_server);
     Serial.print("|");
-    Serial.println(mPort);
+    Serial.println(mqtt_port);
   }
 
   mqtt.setCallback(&mqttData);
-  mqtt.setServer(mHost, mPort);  // client_id, port
+  mqtt.setServer(mqtt_server, stringToNumber(mqtt_port));  // client_id, port
   mqtt.connect(mClientID);
 
   delay(100);
@@ -648,7 +826,7 @@ void setup() {
   // ArduinoOTA.setHostname("myesp8266");
 
   // No authentication by default
-  ArduinoOTA.setPassword((const char *)"123");
+  //ArduinoOTA.setPassword((const char *)"123");
 
   ArduinoOTA.onStart([]() {
     Serial.println("Start");
@@ -677,11 +855,18 @@ void setup() {
  * Main program loop
  */
 void loop() {
-  ArduinoOTA.handle();
+  ArduinoOTA.handle(); // Check for OTA activity
+  if ( digitalRead(TRIGGER_PIN) == LOW ) {
+    //reset settings to allow a new WiFi connection
+    WiFi.removeEvent(wifiCb);
+    WiFiConfig(1);
+    WiFi.onEvent(wifiCb);
+  }
   #ifdef LCD_DISPLAY
-  lcd_update();
+  lcd_update(); 
   #endif
-  mqtt.loop();
+  mqtt.loop();  // MQTT queue flush
+  
   debounceTop.update();
   doorTopState = debounceTop.read();
   debounceBot.update();
