@@ -19,3 +19,5 @@ Goals:
 - Detection of Door Open or Closed using normally open reed switches
 - OTA software update capability
 - WiFi configuration via AP - store credentials in flash memory
+
+http://pablo-sanchez.com/automatic-chicken-coop-door-v1-0/
