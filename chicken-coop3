@@ -21,23 +21,22 @@ This Sketch is designed to work on a ESP-8266 MUANODE 0.9 board
   #include <LiquidCrystal_I2C.h>
 #endif
 #include <ArduinoJson.h>          // https://github.com/bblanchon/ArduinoJson
-//#include "secrets.h"              // holds wifi credentials & MQTT credentials
 #define mClientID "coop-duino"
 #include "pins.h"                 // holds pin definitions
 
-#define CoopTrollerVersion "3.04c"
+#define CoopTrollerVersion "3.04d"
 
 // MQTT Subscription Channels
 #define sTime    "time/beacon"
-#define sRemote  "coop3/remotetrigger"
+#define sRemote  "coop/remotetrigger"
 #define sSunRise "sun/rise"
 #define sSunSet  "sun/set"
 
 // MQTT Publish Channels
-#define pLight  "coop3/brightness"
-#define pStatus "coop3/status"
+#define pLight  "coop/brightness"
+#define pStatus "coop/status"
 
-// DOOR motion
+// DOOR motion. Relays are active on low
 #define GO     0
 #define STOP   1
 
@@ -46,7 +45,8 @@ const unsigned long millisPerDay    = 86400000; // Milliseconds per day
 const unsigned long lightReadRate   =    30000; // How often to read light level (30 sec)
 const unsigned long remoteOverride  =   600000; // Length of time to lockout readings. (10 min)
 const unsigned long publishInterval =   600000; // How often to publish light sensor readings. (10 min)
-const unsigned long maxMotorOn      =    15000; // Maximum time for the motor to be on (15 seconds)
+const unsigned long maxMotorOn      =     6000; // Maximum time for the motor to be on (6 seconds)
+const unsigned long lcdUpdateRate   =     5000; // LCD update rate (5 seconds)
 
 // Night time lockout to prevent reaction to light sensor readings if an exterior light source causes
 // a reading otherwise bright enough to activate the interior light and/or door.
@@ -66,6 +66,7 @@ unsigned long remoteLockStart    =      0;
 unsigned long motorRunning       =      0;  // how long has the motor been on
 unsigned long motorTimeOut       = 300000;  // Time to wait before running motor again (5 minutes)
 unsigned long lastMotorRun       =      0;  // last time the motor was activated
+unsigned long lastLcdUpdate      =      0;  // last time LCD was updated
 String        doorState          =     "Uninitialzed"; // Values will be one of: closed, closing, open, opening, unknown
 String        doorStatePrev      =     "";
 int           brightness         =      0;
@@ -79,14 +80,16 @@ int           doorBottomVal      =      0;
 int           doorBottomVal2     =      0;
 int           doorBottomState    =      0;
 int           doorBottomPrev     =      0;
-uint32_t      bootTime           =      0;
-int           motorHalted        =      0; // Motor protection in case of run away condition
-char          mqtt_msg_buf[100];
+//uint32_t      bootTime           =      0;
+char          mqtt_msg_buf[100];   // Max MQTT incoming message size
 DateTime      now;
+#ifdef LCD_DISPLAY
+char lcd_buf[LCD_COLS];
+#endif
 
 //define your default values here, if there are different values in config.json, they are overwritten.
 char mqtt_server[40];
-char mqtt_port[6] = "8080";
+char mqtt_port[6] = "1883";
 //flag for saving data
 bool shouldSaveConfig = false;
 
@@ -180,6 +183,9 @@ void mqttConnected() {
 void mqttData(char* topic, byte* payload, unsigned int plen) {
 
   // Copy the payload to the MQTT message buffer
+  if( plen > sizeof(mqtt_msg_buf)) {  // buffer is only 100 bytes long
+    plen = sizeof(mqtt_msg_buf);
+  }
   memset(mqtt_msg_buf,'\0',plen+1);
   memcpy(mqtt_msg_buf,payload,plen);
   String data  = String((char *) mqtt_msg_buf);
@@ -198,6 +204,15 @@ void mqttData(char* topic, byte* payload, unsigned int plen) {
     // If door movement is triggered, toggle door state to
     // opening or closing based on current state.
     // If door is currently moving, the trigger is ignored.
+    if (data == "status") {  // get a general status ... (obviously WiFi and MQTT are ok)
+      char buf[100];
+      String pubString;
+      pubString="Door:"+String(doorState)+", Top:"+String(doorTopState)+", Bot:"+String(doorBottomState)+", Light:"+String(brightness);
+      pubString.toCharArray(buf, pubString.length()+1);
+      if (wifiConnected) {
+         mqtt.publish(pStatus, buf);
+      }     
+    }
     if (data == "unlock") {  // this will immediately put the system back into normal operation (i.e., using the light sensor)
       remoteLockStart = 0;
       if (wifiConnected) {
@@ -275,7 +290,8 @@ void mqttData(char* topic, byte* payload, unsigned int plen) {
         }
         sprintf(timeStr, "%02d:%02d:%02d", hr, now.minute(), now.second());
         Serial.println("RTC Updated:");
-        Serial.println(dateStr);
+        Serial.print(dateStr);
+        Serial.print(" ");
         Serial.print(timeStr);
         if (ampm) {
           Serial.println("pm");
@@ -294,80 +310,81 @@ void mqttData(char* topic, byte* payload, unsigned int plen) {
  */
 void doorMove() {
 
-  if (motorHalted == 0 ) {
+  if (doorState != "halted" ) {
     if(motorRunning > 0) {
 
-    if (motorRunning + maxMotorOn < millis()){
-      digitalWrite(doorClose, STOP);
-      digitalWrite(doorOpen, STOP);
-
-      if (Debugging) {
-        Serial.println("Motor on too long - Halting!");
-      }
-
-      if (doorStatePrev != doorState && wifiConnected) {
-        mqtt.publish(pStatus, "door|runaway");
-      }
-      motorHalted = 1;
-     }
-  }
-
-  doorStatePrev = doorState;
-  if (doorState == "closed" || doorState == "closing") {
-    if (doorBottomState != 0) {
-      // Door isn't closed, run motor until it is.
-      if(motorRunning == 0) {  // start your engines
-        digitalWrite(doorClose, GO);
-        digitalWrite(doorOpen, STOP);
-        motorRunning = millis();
-        if (Debugging) {
-          Serial.printf("Motor CLOSE ON: %i\n", motorRunning);
-        }
-      }
-    }
-    else {
-      if (motorRunning > 0) {
-      // Door is closed, stop motor
-      digitalWrite(doorClose, STOP);
-      digitalWrite(doorOpen, STOP);
-      doorState = "closed";
-      motorRunning = 0; // stop the motor running counter
-      if (doorStatePrev != doorState && wifiConnected) {
-        mqtt.publish(pStatus, "door|closed");
-      }
-      if (Debugging) {
-          Serial.println("Motor CLOSE OFF");
-      }
-      }
-    }
-  }
-  else {
-    if (doorTopState != 0) {
-      if(motorRunning == 0) {  // start your engines
-        // Door isn't open, run motor until it is.
+      if (motorRunning + maxMotorOn < millis()){
         digitalWrite(doorClose, STOP);
-        digitalWrite(doorOpen, GO);        motorRunning = millis();
+        digitalWrite(doorOpen, STOP);
+
         if (Debugging) {
-          Serial.printf("Motor OPEN ON: %i \n",motorRunning);
+          Serial.println("Motor on too long - Halting!");
+        }
+
+        if (doorStatePrev != doorState && wifiConnected) {
+          mqtt.publish(pStatus, "door|runaway");
+        }
+        //motorHalted = 1;
+        doorState="halted";
+       }
+    }
+
+    doorStatePrev = doorState;
+    if (doorState == "closed" || doorState == "closing") {
+      if (doorBottomState != 0) {
+        // Door isn't closed, run motor until it is.
+        if(motorRunning == 0) {  // start your engines
+          digitalWrite(doorClose, GO);
+          digitalWrite(doorOpen, STOP);
+          motorRunning = millis();
+          if (Debugging) {
+            Serial.printf("Motor CLOSE ON: %i\n", motorRunning);
+          }
+        }
+      }
+      else {
+        if (motorRunning > 0) {
+          // Door is closed, stop motor
+          digitalWrite(doorClose, STOP);
+          digitalWrite(doorOpen, STOP);
+          doorState = "closed";
+          motorRunning = 0; // stop the motor running counter
+          if (doorStatePrev != doorState && wifiConnected) {
+            mqtt.publish(pStatus, "door|closed");
+          }
+          if (Debugging) {
+            Serial.println("Motor CLOSE OFF");
+          }
         }
       }
     }
-    else {
-      // Door is open, stop motor.
-      if (motorRunning > 0) {
-      digitalWrite(doorClose, STOP);
-      digitalWrite(doorOpen, STOP);
-      doorState = "open";
-      motorRunning = 0; // stop the motor running counter
-      if (doorStatePrev != doorState && wifiConnected) {
-        mqtt.publish(pStatus, "door|open");
+    if (doorState == "open" || doorState == "opening") {
+      if (doorTopState != 0) {
+        if(motorRunning == 0) {  // start your engines
+          // Door isn't open, run motor until it is.
+          digitalWrite(doorClose, STOP);
+          digitalWrite(doorOpen, GO);        motorRunning = millis();
+          if (Debugging) {
+            Serial.printf("Motor OPEN ON: %i \n",motorRunning);
+          }
+        }
       }
-      if (Debugging) {
-        Serial.println("Motor OPEN OFF");
-      }
+      else {
+        // Door is open, stop motor.
+        if (motorRunning > 0) {
+          digitalWrite(doorClose, STOP);
+          digitalWrite(doorOpen, STOP);
+          doorState = "open";
+          motorRunning = 0; // stop the motor running counter
+          if (doorStatePrev != doorState && wifiConnected) {
+            mqtt.publish(pStatus, "door|open");
+          }
+          if (Debugging) {
+            Serial.println("Motor OPEN OFF");
+          }
+        }
       }
     }
-  }
   }
 }
 
@@ -383,7 +400,7 @@ void readSensors() {
     lastLightRead = millis();
 
     char buf[100];
-    String pubString = String(brightness);;
+    String pubString = String(brightness);
     pubString.toCharArray(buf, pubString.length()+1);
     if (wifiConnected) {
        mqtt.publish(pLight, buf);
@@ -421,7 +438,7 @@ void handleSensorReadings() {
   if (nightLock && ( (now.hour() >= nightLockStart || now.hour() <= nightLockEnd)) ) {
 
     // Close door if it is open
-    if (doorState == "open") {
+    if (doorState == "open" || doorState == "unknown") {
       if (Debugging) {
         Serial.println("NIGHTLOCK ENABLED: Closing door.");
       }
@@ -438,7 +455,7 @@ void handleSensorReadings() {
   else {
     // Open door when brightness level is greater than 5%
     if (brightness >= openBright) {
-      if (doorState == "closed") {
+      if (doorState == "closed" || doorState == "unknown") {
         if (Debugging) {
           Serial.println("Opening door.");
         }
@@ -450,7 +467,7 @@ void handleSensorReadings() {
     }
     // Otherwise, close door when light level falls below 2%.
     else if (brightness < closeBright) {
-      if (doorState == "open") {
+      if (doorState == "open" || doorState == "unknown") {
         if (Debugging) {
           Serial.println("Closing door.");
         }
@@ -477,21 +494,41 @@ int stringToNumber(String thisString) {
 
 #ifdef LCD_DISPLAY
 void lcd_update(){
-  //lcd.init();
-  lcd.setCursor(0,0);
-  lcd.print("IP:");
-  lcd.print(WiFi.localIP());
-  lcd.setCursor(0,1);
-  now = RTC.now();
-  char buf[LCD_COLS];
-  sprintf(buf,"Time:%02d:%02d Light:%03d",now.hour(),now.minute(),brightness);
-  lcd.print(buf);
-  lcd.setCursor(0,2);
-  lcd.print("Door:");
-  lcd.print(doorState);
-  lcd.setCursor(0,3);
-  lcd.print("Locked:");
-  lcd.print(remoteLockStart>0);
+  //            1111111111
+  //  01234567890123456789
+  // +--------------------+
+  // |IP:xxx.xxx.xxx.xxx  | 0
+  // |Time:xx:xx Light:xxx| 1
+  // |Door:xxxxxxxx Lock:x| 2
+  // |MQ:xx T:x B:x       | 3
+  // +--------------------+
+
+  if (lastLcdUpdate == 0 || (unsigned long)millis() - lastLcdUpdate > lcdUpdateRate) {
+    lastLcdUpdate = millis();
+    lcd.setCursor(0,0);
+    int a1 = WiFi.localIP()[0];
+    int a2 = WiFi.localIP()[1];
+    int a3 = WiFi.localIP()[2];
+    int a4 = WiFi.localIP()[3];
+    snprintf(lcd_buf,LCD_COLS,"IP:%03i.%03i.%03i.%03i  ",a1,a2,a3,a4);
+    lcd.print(lcd_buf);
+    lcd.setCursor(0,1);
+    now = RTC.now();
+    snprintf(lcd_buf,LCD_COLS,"T:%02d%02d L:%03d",now.hour(),now.minute(),brightness);
+    lcd.print(lcd_buf);
+    lcd.setCursor(0,2);
+    String RLS;
+    RLS = "N";
+    if(remoteLockStart>0) {
+      RLS = "Y";
+    }
+    snprintf(lcd_buf,LCD_COLS,"Door:%-8s Lck:%1s",doorState.c_str(),RLS.c_str());
+    lcd.print(lcd_buf);
+    lcd.setCursor(0,3);
+    int mqs = mqtt.state();
+    snprintf(lcd_buf,LCD_COLS,"MQ:%02i T:%1i B:%1i   ",mqs,doorTopState,doorBottomState);
+    lcd.print(lcd_buf);
+  }
 }
 #endif
 
@@ -618,8 +655,12 @@ void setup() {
     Serial.begin(115200);
     Serial.println("Initialising...");
     Serial.println("Setting motor status to STOP");
+    Serial.print("MQTT info: ");
     Serial.println(pStatus);
   }
+  #ifdef DEBUG_ESP_CORE
+  Serial.setDebugOutput(true);
+  #endif
 
   digitalWrite(doorOpen, STOP);  // Set the moto control relays
   digitalWrite(doorClose, STOP);
@@ -640,16 +681,16 @@ void setup() {
   digitalWrite(doorClose, STOP);
 
   // Get the RTC going
-  Wire.begin(rtcSDA,rtcSCL);
+  Wire.begin(i2cSDA,i2cSCL);
   #ifdef LCD_DISPLAY
   lcd.init();
   delay(500);
   lcd.init();
   lcd.backlight();
-  lcd.print(" CoopTroller  ");
+  lcd.print("CoopTroller   ");
   lcd.print(CoopTrollerVersion);
   lcd.setCursor(0,1);
-  lcd.print(" (C)2016 P. Sanchez");
+  lcd.print("2016 - Pablo Sanchez");
   lcd.setCursor(0,2);
   lcd.print("Compiled on:");
   lcd.setCursor(0,3);
@@ -671,7 +712,8 @@ void setup() {
   if (now.second()<10)
     lcd.print('0');
   lcd.print(now.second(), DEC);
-  delay(750);
+  delay(7000);
+  lcd.init();
   #endif
   
   // Set the outputs
@@ -714,11 +756,6 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
-    #ifdef LCD_DISPLAY
-    lcd.clear();
-    lcd.print("IP:");
-    lcd.print(WiFi.localIP());
-    #endif
     if (Debugging) {
        Serial.println("");
        Serial.println("WiFi connected");
@@ -784,15 +821,15 @@ void setup() {
            Serial.println("Door broken. Opened and closed simultaneously. Halting");
        }
        #ifdef LCD_DISPLAY
-       lcd.clear();
-       lcd.print("Motor Insane");
-       lcd.setCursor(0,1);
-       lcd.print("Halting.");
+       lcd.setCursor(0,2);
+       lcd.print("Door sensors Halting");
        #endif
        if (wifiConnected) {
           mqtt.publish(pStatus,"door|insane");
        }
-       while(1);
+       while(1){
+        yield();
+       }
        break;
     case 1:
        if(doorTopState==0){
@@ -819,7 +856,7 @@ void setup() {
     Serial.print("Initial door state: ");
     Serial.println(doorState);
   }
-  // Port defaults to 8266
+  // Port defaults to 8266 for OTA
   ArduinoOTA.setPort(8266);
 
   // Hostname defaults to esp8266-[ChipID]
@@ -855,16 +892,25 @@ void setup() {
  * Main program loop
  */
 void loop() {
+  if (Debugging) {
+    Serial.println("Loop start");
+  }
   ArduinoOTA.handle(); // Check for OTA activity
   if ( digitalRead(TRIGGER_PIN) == LOW ) {
     //reset settings to allow a new WiFi connection
-    WiFi.removeEvent(wifiCb);
+    //WiFi.removeEvent(wifiCb);
     WiFiConfig(1);
     WiFi.onEvent(wifiCb);
   }
   #ifdef LCD_DISPLAY
+  if (Debugging) {
+    Serial.println("LCD Update");
+  }
   lcd_update(); 
   #endif
+  if (Debugging) {
+    Serial.println("MQTT Update");
+  }
   mqtt.loop();  // MQTT queue flush
   
   debounceTop.update();
@@ -873,7 +919,9 @@ void loop() {
   doorBottomState = debounceBot.read();
 
   // Read new data from sensors
-  readSensors();
+  if (Debugging) {
+    Serial.println("Read Sensors");
+  }  readSensors();
 
   if (remoteLockStart == 0 || (unsigned long)(millis() - remoteLockStart) > remoteOverride) {
     // Respond to sensor data
@@ -881,5 +929,8 @@ void loop() {
   }
 
   // Move the door as needed
+  if (Debugging) {
+    Serial.println("Door Move");
+  }
   doorMove();
 }
