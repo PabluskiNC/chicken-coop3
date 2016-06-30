@@ -84,8 +84,6 @@ int           doorBottomPrev     =      0;
 char          mqtt_msg_buf[100];   // Max MQTT incoming message size
 DateTime      now;
 boolean wifiConnected = false;
-StaticJsonBuffer<200> jsonBuffer;
-JsonObject& mqttJson = jsonBuffer.createObject();
 
 #ifdef LCD_DISPLAY
 char lcd_buf[21]; // LCD cols + 1 for null character
@@ -99,7 +97,7 @@ bool shouldSaveConfig = false;
 
 // Define the hardware components
 // Real Time Clock
-RTC_DS3121 RTC;
+RTC_DS3231 RTC;
 // ESP8266 instance
 EspClass esp;
 // WiFi instance
@@ -224,10 +222,14 @@ void mqttData(char* topic, byte* payload, unsigned int plen) {
          mqtt.publish(pStatus, buf);
       }     
     }
+    /* not ready for prime time
     if (data == "jstatus") { // JSON status
       char buf[201];
-      mqttJson["tstamp"]=Date.now();
-      JsonArray& data = mqttJson.createNestedObject("data");
+      StaticJsonBuffer<200> jsonBuffer;
+      JsonObject& mqttJson = jsonBuffer.createObject();
+      mqttJson["tstamp"]=RTC.now();
+      JsonArray& data = mqttJson.createArray();
+      JsonObject& data = createNestedObject();
       data["brightness"]=Brightness;
       date["doorState"]=doorState;
       data["topState"]=doorTopState;
@@ -235,6 +237,7 @@ void mqttData(char* topic, byte* payload, unsigned int plen) {
       mqttJson.printTo(buf,200);
       mqtt.publish(pStatus,buf);
     }
+    */
     if (data == "unlock") {  // this will immediately put the system back into normal operation (i.e., using the light sensor)
       remoteLockStart = 0;
       if (wifiConnected) {
@@ -743,6 +746,7 @@ void setup() {
     Serial.println("Couldn't find RTC");
     while (1);
   }
+  /* RTC_DS1307
   if (! RTC.isrunning() ) {
     //clockmode = NOT_SET;
     if (Debugging) {
@@ -750,6 +754,7 @@ void setup() {
     }
     RTC.adjust(DateTime(__DATE__, __TIME__));  // try kick starting the clock with the compile time
   }
+  */
   if (Debugging) {
     now = RTC.now();
     Serial.printf("RTC time is: %0d:%0d\n",now.hour(),now.minute());
