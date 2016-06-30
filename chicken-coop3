@@ -24,7 +24,7 @@ This Sketch is designed to work on a ESP-8266 MUANODE 0.9 board
 #define mClientID "coop-duino"
 #include "pins.h"                 // holds pin definitions
 
-#define CoopTrollerVersion "3.04d"
+#define CoopTrollerVersion "3.04e"
 
 // MQTT Subscription Channels
 #define sTime    "time/beacon"
@@ -83,8 +83,12 @@ int           doorBottomPrev     =      0;
 //uint32_t      bootTime           =      0;
 char          mqtt_msg_buf[100];   // Max MQTT incoming message size
 DateTime      now;
+boolean wifiConnected = false;
+StaticJsonBuffer<200> jsonBuffer;
+JsonObject& mqttJson = jsonBuffer.createObject();
+
 #ifdef LCD_DISPLAY
-char lcd_buf[LCD_COLS];
+char lcd_buf[21]; // LCD cols + 1 for null character
 #endif
 
 //define your default values here, if there are different values in config.json, they are overwritten.
@@ -93,26 +97,34 @@ char mqtt_port[6] = "1883";
 //flag for saving data
 bool shouldSaveConfig = false;
 
-//callback notifying us of the need to save config
+// Define the hardware components
+// Real Time Clock
+RTC_DS3121 RTC;
+// ESP8266 instance
+EspClass esp;
+// WiFi instance
+WiFiClient espClient;
+
+// LCD (if enabled)
+#ifdef LCD_DISPLAY
+LiquidCrystal_I2C lcd(0x27, 20, 4);   // i2c address x27, 20 cols x 4 rows
+#endif
+
+// MQTT 
+PubSubClient mqtt(espClient);
+
+// Setup switch debounce software
+Bounce debounceTop = Bounce();
+Bounce debounceBot = Bounce();
+
+
+/**
+ * WiFi Manager callback notifying us of the need to save config
+ */
 void saveConfigCallback () {
   Serial.println("Should save config");
   shouldSaveConfig = true;
 }
-
-// Define the hardware components
-RTC_DS1307 RTC;
-EspClass esp;
-WiFiClient espClient;
-#ifdef LCD_DISPLAY
-LiquidCrystal_I2C lcd(0x27, LCD_COLS, LCD_ROWS);   // i2c address x27, 4 rows x 20 cols
-#endif
-PubSubClient mqtt(espClient);
-
-// Setup debounce software
-Bounce debounceTop = Bounce();
-Bounce debounceBot = Bounce();
-
-boolean wifiConnected = false;
 
 /**
  * Manage WIFI connection
@@ -125,8 +137,7 @@ void wifiCb(WiFiEvent_t event) {
   switch(event) {
       case WIFI_EVENT_STAMODE_GOT_IP:
          if (Debugging) {
-            Serial.println("WiFi connected");
-            Serial.println("IP address: ");
+            Serial.print("WiFi IP: ");
             Serial.println(WiFi.localIP());
          }
          mqtt.connect(mClientID);
@@ -151,10 +162,10 @@ void wifiCb(WiFiEvent_t event) {
  *
  * Subscribes to desired channels
  */
-void mqttConnected() {
+void mqttSubscribe() {
   if (wifiConnected) {
      if (Debugging) {
-       Serial.println("MQTT Connected");
+       Serial.println("MQTT Subscribing");
      }
      // Subscribe to time beacon channel to keep RTC up to date.
      mqtt.subscribe(sTime, 0); // QoS 0 means no verification, 1 means verificaton
@@ -170,7 +181,7 @@ void mqttConnected() {
      mqtt.publish(pStatus, "mqttOnline");
   } else {
      if (Debugging) {
-       Serial.println("MQTT NOT Connected because WIFI is not connected");
+       Serial.println("MQTT NOT Subscribed because WIFI is not connected");
      }
   }
 }
@@ -212,6 +223,17 @@ void mqttData(char* topic, byte* payload, unsigned int plen) {
       if (wifiConnected) {
          mqtt.publish(pStatus, buf);
       }     
+    }
+    if (data == "jstatus") { // JSON status
+      char buf[201];
+      mqttJson["tstamp"]=Date.now();
+      JsonArray& data = mqttJson.createNestedObject("data");
+      data["brightness"]=Brightness;
+      date["doorState"]=doorState;
+      data["topState"]=doorTopState;
+      data["botState"]=doorBottomState;
+      mqttJson.printTo(buf,200);
+      mqtt.publish(pStatus,buf);
     }
     if (data == "unlock") {  // this will immediately put the system back into normal operation (i.e., using the light sensor)
       remoteLockStart = 0;
@@ -493,13 +515,13 @@ int stringToNumber(String thisString) {
 }
 
 #ifdef LCD_DISPLAY
-void lcd_update(){
+void lcdUpdate(){
   //            1111111111
   //  01234567890123456789
   // +--------------------+
   // |IP:xxx.xxx.xxx.xxx  | 0
-  // |Time:xx:xx Light:xxx| 1
-  // |Door:xxxxxxxx Lock:x| 2
+  // |T:xxxx B:xxx        | 1
+  // |D:xxxxxxxx L:x      | 2
   // |MQ:xx T:x B:x       | 3
   // +--------------------+
 
@@ -510,11 +532,11 @@ void lcd_update(){
     int a2 = WiFi.localIP()[1];
     int a3 = WiFi.localIP()[2];
     int a4 = WiFi.localIP()[3];
-    snprintf(lcd_buf,LCD_COLS,"IP:%03i.%03i.%03i.%03i  ",a1,a2,a3,a4);
+    snprintf(lcd_buf,20,"I:%03i.%03i.%03i.%03i  ",a1,a2,a3,a4);
     lcd.print(lcd_buf);
     lcd.setCursor(0,1);
     now = RTC.now();
-    snprintf(lcd_buf,LCD_COLS,"T:%02d%02d L:%03d",now.hour(),now.minute(),brightness);
+    snprintf(lcd_buf,20,"T:%02d%02d B:%03d",now.hour(),now.minute(),brightness);
     lcd.print(lcd_buf);
     lcd.setCursor(0,2);
     String RLS;
@@ -522,11 +544,11 @@ void lcd_update(){
     if(remoteLockStart>0) {
       RLS = "Y";
     }
-    snprintf(lcd_buf,LCD_COLS,"Door:%-8s Lck:%1s",doorState.c_str(),RLS.c_str());
+    snprintf(lcd_buf,20,"D:%-8s L:%1s",doorState.c_str(),RLS.c_str());
     lcd.print(lcd_buf);
     lcd.setCursor(0,3);
     int mqs = mqtt.state();
-    snprintf(lcd_buf,LCD_COLS,"MQ:%02i T:%1i B:%1i   ",mqs,doorTopState,doorBottomState);
+    snprintf(lcd_buf,20,"MQ:%02i T:%1i B:%1i   ",mqs,doorTopState,doorBottomState);
     lcd.print(lcd_buf);
   }
 }
@@ -805,7 +827,7 @@ void setup() {
 
   WiFi.onEvent(wifiCb);
 
-  mqttConnected();
+  mqttSubscribe();
 
   // Findout door status
   debounceTop.update();
@@ -821,12 +843,14 @@ void setup() {
            Serial.println("Door broken. Opened and closed simultaneously. Halting");
        }
        #ifdef LCD_DISPLAY
-       lcd.setCursor(0,2);
-       lcd.print("Door sensors Halting");
+       //lcd.setCursor(0,2);
+       //lcd.print("Door sensors Halting");
+       lcdUpdate();
        #endif
        if (wifiConnected) {
           mqtt.publish(pStatus,"door|insane");
        }
+       // Goto to the corner and stay there
        while(1){
         yield();
        }
@@ -896,23 +920,36 @@ void loop() {
     Serial.println("Loop start");
   }
   ArduinoOTA.handle(); // Check for OTA activity
+
+  // See if user has requested a new WiFi config
   if ( digitalRead(TRIGGER_PIN) == LOW ) {
     //reset settings to allow a new WiFi connection
     //WiFi.removeEvent(wifiCb);
     WiFiConfig(1);
     WiFi.onEvent(wifiCb);
   }
+
+  // Update the LCD screen
   #ifdef LCD_DISPLAY
   if (Debugging) {
     Serial.println("LCD Update");
   }
-  lcd_update(); 
+  lcdUpdate(); 
   #endif
   if (Debugging) {
     Serial.println("MQTT Update");
   }
-  mqtt.loop();  // MQTT queue flush
-  
+
+  // Reconnect MQTT if needed
+  if ( !mqtt.connected() ) {
+    mqtt.connect(mClientID);
+    if ( mqtt.connected() )  {
+      mqttSubscribe();
+    }
+  } else {
+    mqtt.loop();  // MQTT queue flush
+  }
+    
   debounceTop.update();
   doorTopState = debounceTop.read();
   debounceBot.update();
@@ -934,3 +971,4 @@ void loop() {
   }
   doorMove();
 }
+
